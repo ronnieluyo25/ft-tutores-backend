@@ -1,119 +1,205 @@
-async def construir_dashboard(self, dni: str) -> dict:
-    await self._cargar_cache_maestro()
+from datetime import datetime, timedelta
+from app.graph import GraphClient
+from app.config import settings
 
-    tutor = self._cache["tutores_by_dni"].get(str(dni).strip())
-    if not tutor:
-        return {"tutor": None, "resumen": {}, "detalle": []}
 
-    tipo_tutor = self._normalizar_valor(tutor["TipoTutor"])
-    precio_map = (
-        self._cache["precio_antiguo_map"]
-        if tipo_tutor == "ANTIGUO"
-        else self._cache["precio_nuevo_map"]
-    )
+class TutorService:
+    CACHE_MINUTES = 5
 
-    reportes = await self.obtener_todos_los_reportes()
+    def __init__(self):
+        self.graph = GraphClient()
+        self._cache = {
+            "expires_at": None,
+            "site_id": None,
+            "tutores": [],
+            "tutores_by_dni": {},
+            "tutores_by_codigo": {},
+            "dim_idioma_map": {},
+            "precio_antiguo_map": {},
+            "precio_nuevo_map": {},
+            "lista_reporte_id": None,
+        }
 
-    detalle = []
-    total_horas = 0.0
-    total_estimado = 0.0
-    total_reportes = 0
-    total_virtuales = 0
-    total_presenciales = 0
+    # =========================
+    # CACHE
+    # =========================
 
-    for reporte in reportes:
-        if reporte["DNI"] != str(dni).strip():
-            continue
+    def _cache_vigente(self) -> bool:
+        exp = self._cache.get("expires_at")
+        return exp is not None and datetime.utcnow() < exp
 
-        total_reportes += 1
+    async def _cargar_cache_maestro(self):
+        if self._cache_vigente():
+            return
 
-        modalidad = str(reporte.get("Modalidad", "")).strip().upper()
-        if modalidad == "VIRTUAL":
-            total_virtuales += 1
-        elif modalidad == "PRESENCIAL":
-            total_presenciales += 1
+        site_id = await self.graph.get_site_id()
 
-        duracion_horas = self.calcular_duracion_horas(
-            reporte.get("HoraInicio"),
-            reporte.get("HoraFin")
-        )
-        total_horas += duracion_horas
+        lista_tutor = await self.graph.get_list_by_name(site_id, settings.LISTA_TUTOR_NAME)
+        lista_reporte = await self.graph.get_list_by_name(site_id, settings.LISTA_REPORTE_NAME)
+        lista_dim_idioma = await self.graph.get_list_by_name(site_id, settings.LISTA_DIM_IDIOMA_NAME)
+        lista_precio_antiguo = await self.graph.get_list_by_name(site_id, settings.LISTA_PRECIO_ANTIGUO_NAME)
+        lista_precio_nuevo = await self.graph.get_list_by_name(site_id, settings.LISTA_PRECIO_NUEVO_NAME)
 
-        cod_curso = self.extraer_cod_curso(reporte.get("Curso"))
-        cod_modalidad = self.extraer_cod_modalidad(reporte.get("Modalidad"))
-        cod_mod = self.construir_cod_mod(reporte.get("Curso"), reporte.get("Modalidad"))
-        cod_idioma = self._cache["dim_idioma_map"].get(self._normalizar_valor(cod_mod), "")
-        precio = precio_map.get(self._normalizar_valor(cod_idioma), 0.0)
+        tutores_raw = await self.graph.get_list_items(site_id, lista_tutor["id"])
+        dim_idioma_raw = await self.graph.get_list_items(site_id, lista_dim_idioma["id"])
+        precios_antiguos_raw = await self.graph.get_list_items(site_id, lista_precio_antiguo["id"])
+        precios_nuevos_raw = await self.graph.get_list_items(site_id, lista_precio_nuevo["id"])
 
-        monto_estimado = round(duracion_horas * precio, 2)
-        total_estimado += monto_estimado
+        tutores = []
+        tutores_by_dni = {}
+        tutores_by_codigo = {}
 
-        detalle.append({
-            "FechaReporte": reporte.get("FechaReporte"),
-            "NombreAlumno": reporte.get("NombreAlumno"),
-            "Curso": reporte.get("Curso"),
-            "Modalidad": reporte.get("Modalidad"),
-            "HoraInicio": reporte.get("HoraInicio"),
-            "HoraFin": reporte.get("HoraFin"),
-            "DuracionHoras": duracion_horas,
-            "CodCurso": cod_curso,
-            "CodModalidad": cod_modalidad,
-            "CodMod": cod_mod,
-            "CodIdioma": cod_idioma,
-            "Precio": precio,
-            "MontoEstimado": monto_estimado,
-            "TipoReporte": reporte.get("TipoReporte"),
-            "TemasRealizados": reporte.get("TemasRealizados"),
-            "TareasRealizadas": reporte.get("TareasRealizadas"),
-            "ActitudEstudiante": reporte.get("ActitudEstudiante"),
-            "LogrosEstudiante": reporte.get("LogrosEstudiante"),
-            "Recomendacion": reporte.get("Recomendacion"),
-        })
+        for item in tutores_raw:
+            tutor = self.mapear_tutor(item.get("fields", {}))
+            tutores.append(tutor)
 
-    # 🔽 ORDENAR POR FECHA (ASCENDENTE)
-    def parse_fecha(fecha):
-        if not fecha:
-            return datetime.min
+            dni = str(tutor["DNI"]).strip()
+            codigo = str(tutor["Codigo"]).strip()
+
+            if dni:
+                tutores_by_dni[dni] = tutor
+            if codigo:
+                tutores_by_codigo[codigo] = tutor
+
+        dim_idioma_map = {}
+        for item in dim_idioma_raw:
+            fields = item.get("fields", {})
+            cod_mod = self._normalizar_valor(fields.get("field_0"))
+            cod_idioma = str(fields.get("field_4", "")).strip()
+
+            if cod_mod:
+                dim_idioma_map[cod_mod] = cod_idioma
+
+        precio_antiguo_map = {}
+        for item in precios_antiguos_raw:
+            fields = item.get("fields", {})
+            cod_idioma = self._normalizar_valor(fields.get("field_0"))
+            precio = self._to_float(fields.get("field_4"))
+
+            if cod_idioma:
+                precio_antiguo_map[cod_idioma] = precio
+
+        precio_nuevo_map = {}
+        for item in precios_nuevos_raw:
+            fields = item.get("fields", {})
+            cod_idioma = self._normalizar_valor(fields.get("field_0"))
+            precio = self._to_float(fields.get("field_4"))
+
+            if cod_idioma:
+                precio_nuevo_map[cod_idioma] = precio
+
+        self._cache = {
+            "expires_at": datetime.utcnow() + timedelta(minutes=self.CACHE_MINUTES),
+            "site_id": site_id,
+            "tutores": tutores,
+            "tutores_by_dni": tutores_by_dni,
+            "tutores_by_codigo": tutores_by_codigo,
+            "dim_idioma_map": dim_idioma_map,
+            "precio_antiguo_map": precio_antiguo_map,
+            "precio_nuevo_map": precio_nuevo_map,
+            "lista_reporte_id": lista_reporte["id"],
+        }
+
+    async def obtener_todos_los_reportes(self):
+        await self._cargar_cache_maestro()
+
+        site_id = self._cache["site_id"]
+        lista_reporte_id = self._cache["lista_reporte_id"]
+
+        reportes_raw = await self.graph.get_list_items(site_id, lista_reporte_id)
+        return [self.mapear_reporte(item.get("fields", {})) for item in reportes_raw]
+
+    def mapear_tutor(self, fields: dict) -> dict:
+        return {
+            "Codigo": fields.get("field_1"),
+            "DNI": str(fields.get("field_2", "")).strip(),
+            "ApellidoPaterno": fields.get("field_3"),
+            "ApellidoMaterno": fields.get("field_4"),
+            "Nombres": fields.get("field_5"),
+            "TipoTutor": str(fields.get("field_6", "")).strip().upper(),
+            "NombreID": fields.get("field_13"),
+            "Activo": str(fields.get("field_14", "")).strip(),
+        }
+
+    def mapear_reporte(self, fields: dict) -> dict:
+        return {
+            "FechaReporte": fields.get("FechaReporte"),
+            "NombreAlumno": fields.get("NombreAlumno"),
+            "Modalidad": fields.get("Modalidad"),
+            "Curso": fields.get("Curso"),
+            "DNI": str(fields.get("DNI", "")).strip(),
+            "HoraInicio": fields.get("HoraInicio"),
+            "HoraFin": fields.get("HoraFin"),
+        }
+
+    def calcular_duracion_horas(self, inicio, fin):
+        if not inicio or not fin:
+            return 0
+        h1, m1 = map(int, inicio.split(":"))
+        h2, m2 = map(int, fin.split(":"))
+        return round(((h2*60+m2)-(h1*60+m1))/60, 2)
+
+    def _normalizar_valor(self, v):
+        return str(v or "").strip().upper()
+
+    def _to_float(self, v):
         try:
-            return datetime.fromisoformat(fecha.replace("Z", ""))
-        except Exception:
-            return datetime.min
-
-    detalle.sort(key=lambda x: parse_fecha(x.get("FechaReporte")))
+            return float(v)
+        except:
+            return 0.0
 
     # =========================
-    # DATOS TUTOR
+    # DASHBOARD
     # =========================
 
-    nombre = str(tutor.get("Nombres", "")).strip()
-    ap_paterno = str(tutor.get("ApellidoPaterno", "")).strip()
-    ap_materno = str(tutor.get("ApellidoMaterno", "")).strip()
+    async def construir_dashboard(self, dni: str) -> dict:
+        await self._cargar_cache_maestro()
 
-    nombre_completo = f"{ap_paterno} {ap_materno} {nombre}".strip()
+        tutor = self._cache["tutores_by_dni"].get(str(dni).strip())
+        if not tutor:
+            return {"tutor": None, "resumen": {}, "detalle": []}
 
-    tutor_out = {
-        "dni": tutor["DNI"],
-        "codigo": tutor["Codigo"],
-        "nombre": tutor["NombreID"],
-        "nombreCompleto": nombre_completo,
-        "tipoTutor": tutor["TipoTutor"],
-        "activo": tutor["Activo"],
-    }
+        precio_map = self._cache["precio_nuevo_map"]
+        reportes = await self.obtener_todos_los_reportes()
 
-    # =========================
-    # RESUMEN
-    # =========================
+        detalle = []
+        total_horas = 0
+        total_estimado = 0
 
-    resumen = {
-        "totalReportes": total_reportes,
-        "totalHoras": round(total_horas, 2),
-        "totalVirtuales": total_virtuales,
-        "totalPresenciales": total_presenciales,
-        "estimadoTotal": round(total_estimado, 2),
-    }
+        for r in reportes:
+            if r["DNI"] != str(dni).strip():
+                continue
 
-    return {
-        "tutor": tutor_out,
-        "resumen": resumen,
-        "detalle": detalle,
-    }
+            duracion = self.calcular_duracion_horas(r["HoraInicio"], r["HoraFin"])
+            precio = 10
+            monto = duracion * precio
+
+            total_horas += duracion
+            total_estimado += monto
+
+            detalle.append({
+                **r,
+                "DuracionHoras": duracion,
+                "Precio": precio,
+                "MontoEstimado": monto,
+            })
+
+        # 🔥 ORDENAR POR FECHA
+        def parse_fecha(f):
+            if not f:
+                return datetime.min
+            try:
+                return datetime.fromisoformat(str(f).replace("Z", ""))
+            except:
+                return datetime.min
+
+        detalle.sort(key=lambda x: parse_fecha(x["FechaReporte"]))
+
+        return {
+            "tutor": tutor,
+            "resumen": {
+                "totalHoras": total_horas,
+                "estimadoTotal": total_estimado
+            },
+            "detalle": detalle,
+        }
